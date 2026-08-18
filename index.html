@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Article → EPUB</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0b0b0d;--panel:#151518;--field:#1d1d21;--border:#303036;
+  --text:#f7f7f8;--muted:#9999a2;--ok:#73d99b;--warn:#f0c46b;--err:#ff7777;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;min-height:100dvh;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;
+  padding:max(28px,env(safe-area-inset-top)) 18px max(28px,env(safe-area-inset-bottom));
+}
+main{max-width:720px;margin:auto}
+h1{font-size:38px;line-height:1;letter-spacing:-.04em;margin:20px 0 12px}
+.lead{margin:0 0 26px;color:var(--muted);font-size:16px;line-height:1.45}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:24px;padding:16px}
+label{display:block;margin:0 0 8px 2px;color:var(--muted);font-size:13px}
+input{
+  width:100%;padding:15px 14px;border-radius:15px;border:1px solid var(--border);
+  background:var(--field);color:var(--text);outline:none;font-size:16px
+}
+input:focus{border-color:#686872}
+button{
+  width:100%;margin-top:12px;padding:15px 16px;border:0;border-radius:15px;
+  background:#fff;color:#09090a;font-size:16px;font-weight:700
+}
+button.secondary{background:var(--field);color:var(--text);border:1px solid var(--border)}
+button:disabled{opacity:.45}
+.row{display:flex;gap:10px;margin-top:12px;align-items:center}
+.toggle{
+  display:flex;align-items:center;justify-content:space-between;width:100%;
+  background:var(--field);border:1px solid var(--border);border-radius:15px;padding:12px 14px
+}
+.toggle span{font-size:14px}.toggle small{display:block;color:var(--muted);font-size:12px;margin-top:3px}
+.toggle input{width:22px;height:22px;margin:0}
+.status{min-height:22px;margin:14px 2px 0;color:var(--muted);font-size:14px;line-height:1.45}
+.status.ok{color:var(--ok)} .status.warn{color:var(--warn)} .status.error{color:var(--err)}
+.preview{display:none;margin-top:16px;padding-top:16px;border-top:1px solid var(--border)}
+.preview.show{display:block}
+.preview h2{margin:0 0 7px;font-size:20px;line-height:1.25}
+.preview p{margin:0;color:var(--muted);font-size:13px;line-height:1.45;word-break:break-word}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.chip{background:var(--field);color:var(--muted);border-radius:999px;padding:7px 10px;font-size:12px}
+.log{margin-top:12px;background:#101013;border:1px solid var(--border);border-radius:14px;padding:10px 12px;max-height:180px;overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#aaa}
+.log div+div{margin-top:4px}
+.note{margin:18px 2px 0;color:#777780;font-size:12px;line-height:1.5}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>Article → EPUB</h1>
+<p class="lead">Вставь ссылку на публичную статью. Сервис извлечёт текст, скачает изображения через прокси и физически встроит их внутрь EPUB.</p>
+
+<section class="card">
+<label for="articleUrl">Ссылка на статью</label>
+<input id="articleUrl" type="url" inputmode="url" autocomplete="url"
+       autocapitalize="none" autocorrect="off" spellcheck="false"
+       placeholder="https://example.com/article">
+
+<div class="row">
+  <label class="toggle">
+    <span>
+      Строгий режим изображений
+      <small>Не считать EPUB полностью готовым, если часть изображений не удалось скачать</small>
+    </span>
+    <input id="strictImages" type="checkbox" checked>
+  </label>
+</div>
+
+<button id="createBtn" type="button">Создать EPUB</button>
+<button id="shareBtn" type="button" class="secondary hidden">Поделиться EPUB</button>
+<button id="downloadBtn" type="button" class="secondary hidden">Скачать EPUB</button>
+
+<div id="status" class="status"></div>
+
+<div id="preview" class="preview">
+  <h2 id="previewTitle"></h2>
+  <p id="previewSource"></p>
+  <div class="chips">
+    <span class="chip" id="textSize"></span>
+    <span class="chip" id="foundImages"></span>
+    <span class="chip" id="savedImages"></span>
+  </div>
+  <div id="log" class="log"></div>
+</div>
+
+<p class="note">
+  Изображения сохраняются внутрь EPUB, а не как внешние ссылки. Для этого страница должна работать через Cloudflare Worker из комплекта v2.
+</p>
+</section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const input = $("articleUrl");
+  const createBtn = $("createBtn");
+  const shareBtn = $("shareBtn");
+  const downloadBtn = $("downloadBtn");
+  const statusEl = $("status");
+  const preview = $("preview");
+  const logEl = $("log");
+  const strictImages = $("strictImages");
+
+  let lastBlob = null;
+  let lastName = "article.epub";
+
+  function log(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(text, kind="") {
+    statusEl.className = "status" + (kind ? " " + kind : "");
+    statusEl.textContent = text;
+  }
+
+  function escapeXml(s="") {
+    return String(s).replace(/[&<>"']/g, c => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&apos;"
+    }[c]));
+  }
+
+  function safeFileName(s="article") {
+    return (s || "article")
+      .normalize("NFKC")
+      .replace(/[\\/:*?"<>|]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 90) || "article";
+  }
+
+  async function api(path, params) {
+    const qs = new URLSearchParams(params);
+    const response = await fetch(`${path}?${qs.toString()}`);
+    if (!response.ok) {
+      let detail = "";
+      try { detail = (await response.json()).error || ""; } catch {}
+      throw new Error(detail || `HTTP ${response.status}`);
+    }
+    return response;
+  }
+
+  function parseReaderText(raw, originalUrl) {
+    const lines = raw.replace(/\r/g, "").split("\n");
+    let title = "";
+    let source = originalUrl;
+    let start = 0;
+
+    for (let i=0; i<Math.min(lines.length, 80); i++) {
+      const line = lines[i];
+      if (/^Title:\s*/i.test(line)) title = line.replace(/^Title:\s*/i, "").trim();
+      if (/^URL Source:\s*/i.test(line)) source = line.replace(/^URL Source:\s*/i, "").trim();
+      if (/^Markdown Content:\s*$/i.test(line)) { start = i+1; break; }
+    }
+
+    const markdown = lines.slice(start).join("\n").trim();
+    if (!title) {
+      const h1 = markdown.match(/^#\s+(.+)$/m);
+      title = h1 ? h1[1].trim() : new URL(originalUrl).hostname;
+    }
+    return {title, source, markdown};
+  }
+
+  function extractMarkdownImages(md, baseUrl) {
+    const found = [];
+    const seen = new Set();
+
+    // Standard markdown image syntax
+    const rx = /!\[([^\]]*)\]\((\S+?)(?:\s+["'][^"']*["'])?\)/g;
+    let m;
+    while ((m = rx.exec(md)) !== null) {
+      let src = m[2].trim();
+      if (src.startsWith("<") && src.endsWith(">")) src = src.slice(1,-1);
+      try { src = new URL(src, baseUrl).href; } catch { continue; }
+      if (!/^https?:\/\//i.test(src) || seen.has(src)) continue;
+      seen.add(src);
+      found.push({url:src, alt:m[1] || "", original:m[0]});
+    }
+
+    // HTML <img> that can appear in reader markdown
+    const htmlRx = /<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi;
+    while ((m = htmlRx.exec(md)) !== null) {
+      let src = m[1].trim();
+      try { src = new URL(src, baseUrl).href; } catch { continue; }
+      if (!/^https?:\/\//i.test(src) || seen.has(src)) continue;
+      seen.add(src);
+      found.push({url:src, alt:"", original:m[0]});
+    }
+
+    return found;
+  }
+
+  function inlineMarkdown(text) {
+    let s = escapeXml(text);
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)/g,
+      '<a href="$2">$1</a>');
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    s = s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
+    return s;
+  }
+
+  function markdownToXhtml(md, imageMap) {
+    // Replace markdown images with internal EPUB paths before line parsing.
+    for (const [originalUrl, meta] of imageMap.entries()) {
+      const escaped = originalUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const rx = new RegExp(`!\\[([^\\]]*)\\]\\((?:<)?${escaped}(?:>)?(?:\\s+["'][^"']*["'])?\\)`, "g");
+      md = md.replace(rx, (_, alt) => `<figure><img src="${meta.href}" alt="${escapeXml(alt || "")}"/></figure>`);
+    }
+
+    const lines = md.replace(/\r/g, "").split("\n");
+    const out = [];
+    let paragraph = [];
+    let listType = null;
+    let inCode = false;
+    let code = [];
+    let headingIndex = 0;
+    const headings = [];
+
+    const flushP = () => {
+      if (!paragraph.length) return;
+      out.push("<p>" + inlineMarkdown(paragraph.join(" ")) + "</p>");
+      paragraph = [];
+    };
+    const closeList = () => {
+      if (!listType) return;
+      out.push(`</${listType}>`);
+      listType = null;
+    };
+
+    for (const raw of lines) {
+      const line = raw.trimEnd();
+
+      if (/^```/.test(line.trim())) {
+        flushP(); closeList();
+        if (!inCode) { inCode = true; code = []; }
+        else {
+          out.push("<pre><code>" + escapeXml(code.join("\n")) + "</code></pre>");
+          inCode = false; code = [];
+        }
+        continue;
+      }
+      if (inCode) { code.push(raw); continue; }
+
+      if (!line.trim()) { flushP(); closeList(); continue; }
+
+      if (/^<figure>.*<\/figure>$/.test(line.trim())) {
+        flushP(); closeList(); out.push(line.trim()); continue;
+      }
+
+      const h = line.match(/^(#{1,6})\s+(.+)$/);
+      if (h) {
+        flushP(); closeList();
+        const level = Math.min(h[1].length + 1, 6);
+        headingIndex++;
+        const text = h[2].replace(/\s+#+\s*$/, "");
+        headings.push(text.replace(/[*_`]/g, ""));
+        out.push(`<h${level} id="h${headingIndex}">${inlineMarkdown(text)}</h${level}>`);
+        continue;
+      }
+
+      const ul = line.match(/^\s*[-*+]\s+(.+)$/);
+      const ol = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      if (ul || ol) {
+        flushP();
+        const wanted = ul ? "ul" : "ol";
+        if (listType !== wanted) { closeList(); listType = wanted; out.push(`<${wanted}>`); }
+        out.push("<li>" + inlineMarkdown((ul || ol)[1]) + "</li>");
+        continue;
+      }
+
+      const quote = line.match(/^\s*>\s?(.*)$/);
+      if (quote) {
+        flushP(); closeList();
+        out.push("<blockquote><p>" + inlineMarkdown(quote[1]) + "</p></blockquote>");
+        continue;
+      }
+
+      paragraph.push(line.trim());
+    }
+
+    flushP(); closeList();
+    if (inCode && code.length) out.push("<pre><code>" + escapeXml(code.join("\n")) + "</code></pre>");
+    return {html:out.join("\n"), headings};
+  }
+
+  function extensionFor(contentType, url) {
+    const map = {
+      "image/jpeg":"jpg","image/jpg":"jpg","image/png":"png","image/gif":"gif",
+      "image/webp":"webp","image/svg+xml":"svg","image/avif":"avif"
+    };
+    if (map[contentType]) return map[contentType];
+    try {
+      const p = new URL(url).pathname;
+      const ext = p.split(".").pop().toLowerCase();
+      if (["jpg","jpeg","png","gif","webp","svg","avif"].includes(ext)) return ext === "jpeg" ? "jpg" : ext;
+    } catch {}
+    return "jpg";
+  }
+
+  function mediaTypeFor(ext) {
+    return ({
+      jpg:"image/jpeg", jpeg:"image/jpeg", png:"image/png", gif:"image/gif",
+      webp:"image/webp", svg:"image/svg+xml", avif:"image/avif"
+    })[ext] || "image/jpeg";
+  }
+
+  async function downloadImages(images, zip) {
+    const imageMap = new Map();
+    const manifest = [];
+    const failures = [];
+    let index = 0;
+
+    for (const image of images) {
+      index++;
+      log(`Изображение ${index}/${images.length}: ${image.url}`);
+      try {
+        const response = await api("/api/image", {url:image.url});
+        const blob = await response.blob();
+        const contentType = (response.headers.get("content-type") || blob.type || "").split(";")[0];
+        if (!contentType.startsWith("image/")) throw new Error("ответ не является изображением");
+
+        const ext = extensionFor(contentType, image.url);
+        const filename = `image-${String(index).padStart(3,"0")}.${ext}`;
+        const href = `images/${filename}`;
+
+        zip.file(`EPUB/${href}`, blob);
+        imageMap.set(image.url, {href, alt:image.alt});
+        manifest.push({
+          id:`img${index}`,
+          href,
+          mediaType:mediaTypeFor(ext)
+        });
+        log(`✓ встроено: ${filename}`);
+      } catch (err) {
+        failures.push({url:image.url, error:err.message || String(err)});
+        log(`✕ не удалось: ${err.message || err}`);
+      }
+    }
+
+    return {imageMap, manifest, failures};
+  }
+
+  async function buildEpub(article, imageResults) {
+    if (!window.JSZip) throw new Error("Не загрузилась библиотека JSZip.");
+    const zip = imageResults.zip || new JSZip();
+
+    zip.file("mimetype", "application/epub+zip", {compression:"STORE"});
+    zip.file("META-INF/container.xml", `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="EPUB/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`);
+
+    const converted = markdownToXhtml(article.markdown, imageResults.imageMap);
+
+    const articleXhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>${escapeXml(article.title)}</title>
+<link rel="stylesheet" type="text/css" href="styles.css"/>
+</head>
+<body>
+<article>
+<h1>${escapeXml(article.title)}</h1>
+<p class="source">Source: <a href="${escapeXml(article.source)}">${escapeXml(article.source)}</a></p>
+${converted.html}
+</article>
+</body>
+</html>`;
+
+    const toc = converted.headings.length
+      ? converted.headings.map((h,i)=>`<li><a href="article.xhtml#h${i+1}">${escapeXml(h)}</a></li>`).join("")
+      : `<li><a href="article.xhtml">${escapeXml(article.title)}</a></li>`;
+
+    zip.file("EPUB/article.xhtml", articleXhtml);
+    zip.file("EPUB/nav.xhtml", `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<head><meta charset="utf-8"/><title>Contents</title></head>
+<body><nav epub:type="toc" id="toc"><h1>Contents</h1><ol>${toc}</ol></nav></body>
+</html>`);
+
+    zip.file("EPUB/styles.css", `
+body{font-family:serif;line-height:1.58;margin:5%;color:#111}
+article{max-width:42em;margin:0 auto}
+h1,h2,h3,h4,h5,h6{line-height:1.2}
+h1{font-size:2em;margin-bottom:.4em}
+h2{font-size:1.5em;margin-top:1.8em}
+h3{font-size:1.25em;margin-top:1.5em}
+p,li{font-size:1em}
+figure{margin:1.4em 0;text-align:center}
+img{display:block;max-width:100%;height:auto;margin:0 auto}
+blockquote{margin:1.25em 0;padding-left:1em;border-left:.2em solid #999}
+pre{white-space:pre-wrap;word-break:break-word;font-family:monospace;font-size:.9em}
+code{font-family:monospace}
+.source{font-size:.8em;color:#666;word-break:break-all;margin-bottom:2em}
+a{color:inherit;text-decoration:underline}
+`);
+
+    const uuid = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    const modified = new Date().toISOString().replace(/\.\d{3}Z$/,"Z");
+    const imageManifest = imageResults.manifest.map(x =>
+      `<item id="${x.id}" href="${x.href}" media-type="${x.mediaType}"/>`
+    ).join("\n    ");
+
+    zip.file("EPUB/package.opf", `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="pub-id">urn:uuid:${escapeXml(uuid)}</dc:identifier>
+    <dc:title>${escapeXml(article.title)}</dc:title>
+    <dc:language>en</dc:language>
+    <dc:source>${escapeXml(article.source)}</dc:source>
+    <meta property="dcterms:modified">${modified}</meta>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="article" href="article.xhtml" media-type="application/xhtml+xml"/>
+    <item id="css" href="styles.css" media-type="text/css"/>
+    ${imageManifest}
+  </manifest>
+  <spine><itemref idref="article"/></spine>
+</package>`);
+
+    return zip.generateAsync({
+      type:"blob",
+      mimeType:"application/epub+zip",
+      compression:"DEFLATE",
+      compressionOptions:{level:6}
+    });
+  }
+
+  function download(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 30000);
+  }
+
+  createBtn.addEventListener("click", async () => {
+    let url = input.value.trim();
+    if (!url) return setStatus("Вставь ссылку на статью.", "error");
+    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+    try { new URL(url); } catch { return setStatus("Некорректная ссылка.", "error"); }
+
+    createBtn.disabled = true;
+    shareBtn.classList.add("hidden");
+    downloadBtn.classList.add("hidden");
+    preview.classList.remove("show");
+    logEl.innerHTML = "";
+    lastBlob = null;
+
+    try {
+      setStatus("Извлекаю статью…");
+      log("Запрашиваю Reader через Worker…");
+      const response = await api("/api/article", {url});
+      const raw = await response.text();
+      if (raw.trim().length < 200) throw new Error("получено слишком мало текста");
+
+      const article = parseReaderText(raw, url);
+      const images = extractMarkdownImages(article.markdown, article.source);
+
+      $("previewTitle").textContent = article.title;
+      $("previewSource").textContent = article.source;
+      $("textSize").textContent = `${Math.max(1, Math.round(article.markdown.length/1000))} тыс. знаков`;
+      $("foundImages").textContent = `найдено изображений: ${images.length}`;
+      $("savedImages").textContent = `встроено: 0`;
+      preview.classList.add("show");
+
+      const zip = new JSZip();
+      setStatus(`Скачиваю изображения: 0/${images.length}…`);
+      const imageResults = await downloadImages(images, zip);
+      imageResults.zip = zip;
+
+      const savedCount = imageResults.manifest.length;
+      $("savedImages").textContent = `встроено: ${savedCount}`;
+
+      if (strictImages.checked && imageResults.failures.length) {
+        setStatus(
+          `Не удалось встроить ${imageResults.failures.length} из ${images.length} изображений. EPUB пока не создан.`,
+          "warn"
+        );
+        log("Строгий режим остановил сборку.");
+        return;
+      }
+
+      setStatus("Собираю EPUB…");
+      lastBlob = await buildEpub(article, imageResults);
+      lastName = safeFileName(article.title) + ".epub";
+
+      downloadBtn.classList.remove("hidden");
+
+      if (navigator.share && navigator.canShare) {
+        try {
+          const f = new File([lastBlob], lastName, {type:"application/epub+zip"});
+          if (navigator.canShare({files:[f]})) shareBtn.classList.remove("hidden");
+        } catch {}
+      }
+
+      if (imageResults.failures.length) {
+        setStatus(
+          `EPUB готов. Встроено ${savedCount} из ${images.length} изображений.`,
+          "warn"
+        );
+      } else {
+        setStatus(
+          `Готово. Все найденные изображения встроены: ${savedCount}/${images.length}.`,
+          "ok"
+        );
+      }
+
+    } catch (err) {
+      console.error(err);
+      setStatus("Ошибка: " + (err?.message || String(err)), "error");
+      log("Ошибка: " + (err?.message || String(err)));
+    } finally {
+      createBtn.disabled = false;
+    }
+  });
+
+  shareBtn.addEventListener("click", async () => {
+    if (!lastBlob) return;
+    try {
+      const file = new File([lastBlob], lastName, {type:"application/epub+zip"});
+      await navigator.share({files:[file], title:lastName});
+    } catch (err) {
+      if (err?.name !== "AbortError") setStatus("Не удалось открыть меню «Поделиться».", "error");
+    }
+  });
+
+  downloadBtn.addEventListener("click", () => {
+    if (lastBlob) download(lastBlob, lastName);
+  });
+
+  const fromQuery = new URLSearchParams(location.search).get("url");
+  if (fromQuery) input.value = fromQuery;
+})();
+</script>
+</body>
+</html>
